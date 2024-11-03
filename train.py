@@ -13,19 +13,33 @@ from tqdm import tqdm
 import random
 import os
 import copy
+from logger import Logger
+from utils import *
+from networks.autoencoder import ResidualAE
+from torch.cuda.amp import GradScaler, autocast
+# 初始化GradScaler 用于混合精度
+scaler = GradScaler()
 
-# Set random seed
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+current_root=get_current_root(__file__)
 
 set_seed(42)
 
 # Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = get_device()
+
+log_name=get_exec_name(__file__)
+
+print(log_name)
+print('-'*50)
+#loss weight
+text_contrastive_loss_w=0.2
+audio_contrastive_loss_w=0.2
+classification_loss_w=1
+binary_classification_loss_w=0.2
+modal_contrastive_loss_w=0.2
+aug_classification_loss_w=1
+aug_text_loss_w=0.2
+aug_audio_loss_w=0.2
 
 # Define single modality projection heads
 class AudioProjectionHead(nn.Module):
@@ -83,6 +97,7 @@ class GetTextEmbedding(nn.Module):
 
 # Instantiate models
 num_labels = 4
+batch_size=4
 TextEmbedding_model_init = GetTextEmbedding(roberta_tokenizer, roberta_model_init).to(device)
 
 # Initialize multimodal fusion model
@@ -92,7 +107,7 @@ bert_config = BertConfig(
     num_attention_heads=8,
     intermediate_size=4096,
     max_position_embeddings=2800,
-    num_labels=4
+    num_labels=num_labels
 )
 Bert_adapter_multimodel_fusion_init = MultimodalBertModel(bert_config).to(device)
 
@@ -101,7 +116,8 @@ audio_projection_head_init = AudioProjectionHead(input_dim=1024, output_dim=1024
 text_projection_head_init = TextProjectionHead(input_dim=roberta_model_init.config.hidden_size, output_dim=1024).to(device)
 
 # Initialize loss function
-classification_criterion = nn.CrossEntropyLoss()
+classification_criterion = nn.CrossEntropyLoss()    #分类损失
+augmentation_constr_crit=nn.MSELoss()               #比较与原始样本特征的差距
 
 # Define contrastive loss function
 def nt_xent_loss(embeddings1, embeddings2, temperature):
@@ -124,7 +140,6 @@ def nt_xent_loss(embeddings1, embeddings2, temperature):
     # Cross-entropy loss
     loss = F.cross_entropy(similarity_matrix, labels)
     return loss
-
 
 # 模态间对比学习损失（NCE）
 def modal_nt_xent_loss(audio_embeddings, text_embeddings, temperature):
@@ -157,6 +172,26 @@ def create_binary_classification_pairs(audio_embeddings, text_embeddings, labels
                 pairs.append((audio_embeddings[i], text_embeddings[j]))
                 pair_labels.append(1 if labels[i] == labels[j] else 0)
     return pairs, pair_labels
+
+def get_cls_from_seq_max_pooling(input_tensor):
+    """
+    使用最大池化获取分类向量。
+    
+    :param input_tensor: 形状为 [batch_size, seq_len, feat_dim] 的张量
+    :return: 形状为 [batch_size, feat_dim] 的张量
+    """
+    max_pooled, _ = torch.max(input_tensor, dim=1)  # 沿着 seq_len 维度求最大值
+    return max_pooled
+
+def get_cls_from_seq_avg_pooling(input_tensor):
+    """
+    使用平均池化获取分类向量。
+    
+    :param input_tensor: 形状为 [batch_size, seq_len, feat_dim] 的张量
+    :return: 形状为 [batch_size, feat_dim] 的张量
+    """
+    avg_pooled = torch.mean(input_tensor, dim=1)  # 沿着 seq_len 维度求平均
+    return avg_pooled
 
 # Evaluate model function
 def evaluate_model(text_model, audio_model, fusion_model, dataloader):
@@ -215,10 +250,13 @@ def evaluate_model(text_model, audio_model, fusion_model, dataloader):
     return accuracy, avg_loss, weighted_accuracy, class_accuracy, class_weights
 
 # Training loop
-num_epochs = 30
+num_epochs = 100
 best_model_path = 'best_emotion_prediction_model.pth'
 best_accuracy = 0.0
-
+# Initialize the feature augmentation networks
+AE_layers, AE_blk_num, AE_input_dim=[256,128,64],5,1024
+audio_feature_augmentation = ResidualAE(AE_layers, AE_blk_num, AE_input_dim, dropout=0, use_bn=False).to(device)
+text_feature_augmentation = ResidualAE(AE_layers, AE_blk_num, AE_input_dim, dropout=0, use_bn=False).to(device)
 # Deep copy initial models
 base_temperature_model = temperature_model_init.to(device)
 base_text_model = TextEmbedding_model_init.to(device)
@@ -227,9 +265,16 @@ base_text_projection_head = text_projection_head_init.to(device)
 base_audio_projection_head = audio_projection_head_init.to(device)
 base_fusion_model = Bert_adapter_multimodel_fusion_init.to(device)
 
+
+session_id=1
+# logger=Logger(current_root/'log'/f'{get_datetime()}_{log_name}_session{session_id}.log')
+
+
 # Loop over sessions
-for session_id in range(1, 6):
+# for session_id in range(1, 6):
+if session_id:
     print(f"Training on Session {session_id}")
+    logger=Logger(current_root/'log'/f'{get_datetime()}_{log_name}_session{session_id}.log')
     # Initialize models
     temperature_model_init.load_state_dict(base_temperature_model.state_dict())
     TextEmbedding_model_init.load_state_dict(base_text_model.state_dict())
@@ -238,18 +283,20 @@ for session_id in range(1, 6):
     audio_projection_head_init.load_state_dict(base_audio_projection_head.state_dict())
     Bert_adapter_multimodel_fusion_init.load_state_dict(base_fusion_model.state_dict())
 
+    # Update the optimizer to include the augmentation networks
     optimizer = torch.optim.Adam(
-        list(temperature_model_init.parameters()) + list(TextEmbedding_model_init.parameters()) + list(audio_model.parameters()) +
-        list(text_projection_head_init.parameters()) + list(audio_projection_head_init.parameters()) +
-        list(Bert_adapter_multimodel_fusion_init.parameters()), lr=1e-5
-    )
-
-    train_dataset = IEMOCAPDataset('train_features_session5.pkl')
-    train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=collate_fn, drop_last=True)
-    val_dataset = IEMOCAPDataset('val_features_session5.pkl')
-    val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn, drop_last=True)
+    list(temperature_model_init.parameters()) + list(TextEmbedding_model_init.parameters()) + list(audio_model.parameters()) +
+    list(text_projection_head_init.parameters()) + list(audio_projection_head_init.parameters()) +
+    list(Bert_adapter_multimodel_fusion_init.parameters()) +
+    list(audio_feature_augmentation.parameters()) + list(text_feature_augmentation.parameters()), lr=1e-5)
+    
+    train_dataset = IEMOCAPDataset(f'train_features_session{session_id}.pkl')
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, drop_last=True)
+    val_dataset = IEMOCAPDataset(f'val_features_session{session_id}.pkl')
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, drop_last=True)
 
     for epoch in range(num_epochs):
+
         total_loss = 0
         temperature_model_init.train()
         TextEmbedding_model_init.train()
@@ -257,58 +304,92 @@ for session_id in range(1, 6):
         text_projection_head_init.train()
         audio_projection_head_init.train()
         Bert_adapter_multimodel_fusion_init.train()
-        for batch in tqdm(train_dataloader, desc=f"Session {session_id} Epoch {epoch + 1}/{num_epochs}"):
+        audio_feature_augmentation.train()
+        text_feature_augmentation.train()
+
+        for batch in tqdm(train_dataloader, desc=f"Session {session_id} Train Epoch {epoch + 1}/{num_epochs}", ncols=75):
             raw_audio_input_ids, raw_attention_masks, aug_audio_input_ids, aug_attention_masks, \
             raw_audio_dimensions, aug_audio_dimensions, raw_text, aug_text, labels = batch['raw_audio_input_ids'], batch['raw_attention_masks'], \
-                                                                                     batch['aug_audio_input_ids'], batch['aug_attention_masks'], \
-                                                                                     batch['raw_audio_dimensions'], batch['aug_audio_dimensions'], \
-                                                                                     batch['raw_text'], batch['aug_text'], batch['label']
+                                                                                 batch['aug_audio_input_ids'], batch['aug_attention_masks'], \
+                                                                                 batch['raw_audio_dimensions'], batch['aug_audio_dimensions'], \
+                                                                                 batch['raw_text'], batch['aug_text'], batch['label']
+
             optimizer.zero_grad()
-            # Get text embeddings
+
+         # Get text embeddings and apply augmentation
             raw_text_seq_embedding, raw_text_cls_embeddings = TextEmbedding_model_init(raw_text)
-
-            aug_text_seq_embedding, aug_text_cls_embeddings = TextEmbedding_model_init(aug_text)
-
+            # print(f'text_shape: seq:{raw_text_seq_embedding.shape}; cls:{raw_text_cls_embeddings.shape}')
             raw_text_cls_embeddings = text_projection_head_init(raw_text_cls_embeddings)
-            aug_text_cls_embeddings = text_projection_head_init(aug_text_cls_embeddings)
+            
+            aug_text_seq_embedding,_ = text_feature_augmentation(raw_text_seq_embedding)
+            aug_text_loss=augmentation_constr_crit(aug_text_seq_embedding,raw_text_seq_embedding)
+            aug_text_cls_embeddings = get_cls_from_seq_avg_pooling(aug_text_seq_embedding)  # Apply text augmentation
 
-            # Get audio embeddings
+        # Get audio embeddings and apply augmentation
             raw_audio_seq_embedding, raw_audio_cls_embeddings, _ = audio_model(raw_audio_input_ids, raw_attention_masks)
-            aug_audio_seq_embedding, aug_audio_cls_embeddings, _ = audio_model(aug_audio_input_ids, aug_attention_masks)
-
+            # print(f'audio_shape: seq:{raw_audio_seq_embedding.shape}; cls:{raw_audio_cls_embeddings.shape}')
             raw_audio_cls_embeddings = audio_projection_head_init(raw_audio_cls_embeddings)
-            aug_audio_cls_embeddings = audio_projection_head_init(aug_audio_cls_embeddings)
 
-            # Compute contrastive losses
+            aug_audio_seq_embedding,_ = audio_feature_augmentation(raw_audio_seq_embedding)
+            aug_audio_loss=augmentation_constr_crit(raw_audio_seq_embedding,aug_audio_seq_embedding)
+            aug_audio_cls_embeddings = get_cls_from_seq_avg_pooling(aug_audio_seq_embedding) # Apply audio augmentation
+
+        # Compute contrastive losses with augmented features
             temperature = temperature_model_init()
             text_contrastive_loss = nt_xent_loss(raw_text_cls_embeddings, aug_text_cls_embeddings, temperature)
             audio_contrastive_loss = nt_xent_loss(raw_audio_cls_embeddings, aug_audio_cls_embeddings, temperature)
-            # 计算模态间的对比损失 (NCE) - 原始音频与文本对之间的对比
             modal_contrastive_loss = modal_nt_xent_loss(raw_audio_cls_embeddings, raw_text_cls_embeddings, temperature)
 
-            # Fuse modalities and compute classification logits
+        # Fuse modalities and compute classification logits
             logits, binary_logits, fusion_Cls = Bert_adapter_multimodel_fusion_init(raw_audio_seq_embedding, raw_text_seq_embedding)
-            # Compute classification loss
+
+        # Compute classification loss
             classification_loss = classification_criterion(logits, labels.to(device))
-            ###创建二分类任务
-            binary_pairs,  binary_pair_labels = create_binary_classification_pairs(raw_audio_seq_embedding, raw_text_seq_embedding, labels)
+
+            aug_logits, aug_binary_logits, aug_fusion_Cls = Bert_adapter_multimodel_fusion_init(aug_audio_seq_embedding, aug_text_seq_embedding)
+
+        # Compute classification loss of augmented_data
+            aug_classification_loss = classification_criterion(logits, labels.to(device))
+
+        # Binary classification loss
+            binary_pairs, binary_pair_labels = create_binary_classification_pairs(raw_audio_seq_embedding, raw_text_seq_embedding, labels)
             binary_pairs_audio = torch.stack([pair[0] for pair in binary_pairs]).to(device)
             binary_pairs_text = torch.stack([pair[1] for pair in binary_pairs]).to(device)
             binary_pair_labels = torch.tensor(binary_pair_labels).to(device)
-            _, binary_logits, _ = Bert_adapter_multimodel_fusion_init(binary_pairs_audio,binary_pairs_text)
+            _, binary_logits, _ = Bert_adapter_multimodel_fusion_init(binary_pairs_audio, binary_pairs_text)
             binary_classification_loss = classification_criterion(binary_logits, binary_pair_labels)
+
+            with autocast():
             # Total loss
-            loss = 0.2*text_contrastive_loss + 0.2*audio_contrastive_loss + 0.4*classification_loss + 0.2*binary_classification_loss+0.2*modal_contrastive_loss
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+                loss = text_contrastive_loss_w*text_contrastive_loss\
+                    + audio_contrastive_loss_w*audio_contrastive_loss\
+                    + classification_loss_w*classification_loss\
+                    + binary_classification_loss_w*binary_classification_loss\
+                    + modal_contrastive_loss_w*modal_contrastive_loss\
+                    +aug_classification_loss_w*aug_classification_loss\
+                    +aug_text_loss_w*aug_text_loss\
+                    +aug_audio_loss_w*aug_audio_loss
+                # loss.backward()
+                # optimizer.step()
+                total_loss += loss.item()
+            
+            # 反向传播
+            scaler.scale(loss).backward()
+
+            # 更新权重
+            scaler.step(optimizer)
+
+            # 更新缩放器
+            scaler.update()
 
         print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {total_loss / len(train_dataloader):.4f}")
 
         # Evaluate model
         accuracy, avg_loss, weighted_accuracy, class_accuracy, class_weights = evaluate_model(
-            TextEmbedding_model_init, audio_model, Bert_adapter_multimodel_fusion_init, val_dataloader
+            TextEmbedding_model_init, audio_model, Bert_adapter_multimodel_fusion_init,
+            tqdm(val_dataloader, desc=f"Session {session_id} Test Epoch {epoch + 1}/{num_epochs}" ,ncols=75)
         )
         print(f"Validation Results - Epoch {epoch + 1}")
         print(f"Accuracy: {accuracy:.4f}, Average Loss: {avg_loss:.4f}, Weighted Accuracy: {weighted_accuracy:.4f}")
         print(f"Class-wise Accuracy: {class_accuracy}")
+        print('-'*50)
