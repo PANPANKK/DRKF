@@ -7,16 +7,24 @@ from transformers import RobertaTokenizer, RobertaModel, Wav2Vec2Processor, Wav2
 from transformers import BertConfig
 import torchaudio
 import numpy as np
-from pre_processor import *
-from multi_modality_fusion import *
+from dataloaders.iemocap_pre_processor import *
 from tqdm import tqdm
 import random
 import os
 import copy
-from logger import Logger
-from utils import *
-from networks.autoencoder import ResidualAE
+from utils.logger import Logger
+from utils.tools import *
+from models.subnets.auto_encoder import ResidualAE
+from models.subnets.pooling import *
+from models.subnets.proj_head import *
+from models.subnets.temperature_model import *
+from models.subnets.text_embedding import *
 from torch.cuda.amp import GradScaler, autocast
+from models.fusion_classifier import MultimodalBertModel
+from models.contrastive import *
+
+from config.hyper_params_config import *
+
 # 初始化GradScaler 用于混合精度
 scaler = GradScaler()
 
@@ -31,74 +39,7 @@ log_name=get_exec_name(__file__)
 
 print(log_name)
 print('-'*50)
-#loss weight
-text_contrastive_loss_w=0.2
-audio_contrastive_loss_w=0.2
-classification_loss_w=1
-binary_classification_loss_w=0.2
-modal_contrastive_loss_w=0.2
-aug_classification_loss_w=1
-aug_text_loss_w=0.2
-aug_audio_loss_w=0.2
 
-# Define single modality projection heads
-class AudioProjectionHead(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(AudioProjectionHead, self).__init__()
-        self.fc1 = nn.Linear(input_dim, input_dim)
-        self.fc2 = nn.Linear(input_dim, output_dim)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.fc2(x)
-        return x
-
-class TextProjectionHead(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(TextProjectionHead, self).__init__()
-        self.fc1 = nn.Linear(input_dim, input_dim)
-        self.fc2 = nn.Linear(input_dim, output_dim)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.fc2(x)
-        return x
-
-# Define temperature model
-class TemperatureModel(nn.Module):
-    def __init__(self, initial_temp=1.0):
-        super(TemperatureModel, self).__init__()
-        self.temperature = nn.Parameter(torch.tensor(initial_temp))
-
-    def forward(self):
-        return torch.sigmoid(self.temperature)  # Limit temperature between 0 and 1
-
-temperature_model_init = TemperatureModel().to(device)
-
-# RoBERTa configuration
-roberta_tokenizer = RobertaTokenizer.from_pretrained('../roberta-large-uncased')
-roberta_model_init = RobertaModel.from_pretrained('../roberta-large-uncased').to(device)
-
-# Get text embeddings
-class GetTextEmbedding(nn.Module):
-    def __init__(self, tokenizer, text_model):
-        super(GetTextEmbedding, self).__init__()
-        self.tokenizer = tokenizer
-        self.text_model = text_model
-
-    def forward(self, text_inputs):
-        text_embeddings = self.tokenizer(text_inputs, return_tensors='pt', padding=True, truncation=True,
-                                         max_length=80).to(device)
-        text_output = self.text_model(**text_embeddings)
-        text_seq_embedding, text_cls_embeddings = text_output[0], text_output[1]
-        return text_seq_embedding, text_cls_embeddings
-
-# Instantiate models
-num_labels = 4
-batch_size=4
-TextEmbedding_model_init = GetTextEmbedding(roberta_tokenizer, roberta_model_init).to(device)
 
 # Initialize multimodal fusion model
 bert_config = BertConfig(
@@ -109,6 +50,22 @@ bert_config = BertConfig(
     max_position_embeddings=2800,
     num_labels=num_labels
 )
+AE_layers, AE_blk_num, AE_input_dim=[256,128,64],5,1024
+
+roberta_path='../roberta-large-uncased'
+
+# Define temperature model
+
+temperature_model_init = TemperatureModel().to(device)
+
+# RoBERTa configuration
+roberta_tokenizer = RobertaTokenizer.from_pretrained(roberta_path)
+roberta_model_init = RobertaModel.from_pretrained(roberta_path).to(device)
+
+
+
+TextEmbedding_model_init = GetTextEmbedding(roberta_tokenizer, roberta_model_init).to(device)
+
 Bert_adapter_multimodel_fusion_init = MultimodalBertModel(bert_config).to(device)
 
 # Initialize projection heads
@@ -119,79 +76,6 @@ text_projection_head_init = TextProjectionHead(input_dim=roberta_model_init.conf
 classification_criterion = nn.CrossEntropyLoss()    #分类损失
 augmentation_constr_crit=nn.MSELoss()               #比较与原始样本特征的差距
 
-# Define contrastive loss function
-def nt_xent_loss(embeddings1, embeddings2, temperature):
-    batch_size = embeddings1.size(0)
-    device = embeddings1.device
-    # Normalize embeddings
-    embeddings1 = F.normalize(embeddings1, dim=1)
-    embeddings2 = F.normalize(embeddings2, dim=1)
-    # Concatenate embeddings
-    embeddings = torch.cat([embeddings1, embeddings2], dim=0)  # [2*batch_size, dim]
-    # Compute similarity matrix
-    similarity_matrix = torch.matmul(embeddings, embeddings.t())  # [2*batch_size, 2*batch_size]
-    # Remove self-similarity
-    mask = torch.eye(2 * batch_size).bool().to(device)
-    similarity_matrix = similarity_matrix.masked_fill(mask, -9e15)
-    # Create labels for positive pairs
-    labels = torch.cat([torch.arange(batch_size, 2 * batch_size), torch.arange(batch_size)]).to(device)
-    # Similarity divided by temperature
-    similarity_matrix = similarity_matrix / temperature
-    # Cross-entropy loss
-    loss = F.cross_entropy(similarity_matrix, labels)
-    return loss
-
-# 模态间对比学习损失（NCE）
-def modal_nt_xent_loss(audio_embeddings, text_embeddings, temperature):
-    batch_size = audio_embeddings.size(0)
-    device = audio_embeddings.device
-
-    # Normalize embeddings
-    audio_embeddings = F.normalize(audio_embeddings, dim=1)
-    text_embeddings = F.normalize(text_embeddings, dim=1)
-
-    # Similarity matrix between audio and text
-    similarity_matrix = torch.matmul(audio_embeddings, text_embeddings.t())  # [batch_size, batch_size]
-
-    # Similarity divided by temperature
-    similarity_matrix = similarity_matrix / temperature
-
-    # Create labels (positive pairs are diagonal elements)
-    labels = torch.arange(batch_size).to(device)
-
-    # Cross-entropy loss
-    loss = F.cross_entropy(similarity_matrix, labels)
-    return loss
-
-def create_binary_classification_pairs(audio_embeddings, text_embeddings, labels):
-    pairs = []
-    pair_labels = []
-    for i in range(len(labels)):
-        for j in range(len(labels)):
-            if i != j:
-                pairs.append((audio_embeddings[i], text_embeddings[j]))
-                pair_labels.append(1 if labels[i] == labels[j] else 0)
-    return pairs, pair_labels
-
-def get_cls_from_seq_max_pooling(input_tensor):
-    """
-    使用最大池化获取分类向量。
-    
-    :param input_tensor: 形状为 [batch_size, seq_len, feat_dim] 的张量
-    :return: 形状为 [batch_size, feat_dim] 的张量
-    """
-    max_pooled, _ = torch.max(input_tensor, dim=1)  # 沿着 seq_len 维度求最大值
-    return max_pooled
-
-def get_cls_from_seq_avg_pooling(input_tensor):
-    """
-    使用平均池化获取分类向量。
-    
-    :param input_tensor: 形状为 [batch_size, seq_len, feat_dim] 的张量
-    :return: 形状为 [batch_size, feat_dim] 的张量
-    """
-    avg_pooled = torch.mean(input_tensor, dim=1)  # 沿着 seq_len 维度求平均
-    return avg_pooled
 
 # Evaluate model function
 def evaluate_model(text_model, audio_model, fusion_model, dataloader):
@@ -393,3 +277,4 @@ if session_id:
         print(f"Accuracy: {accuracy:.4f}, Average Loss: {avg_loss:.4f}, Weighted Accuracy: {weighted_accuracy:.4f}")
         print(f"Class-wise Accuracy: {class_accuracy}")
         print('-'*50)
+    logger.__del__()
