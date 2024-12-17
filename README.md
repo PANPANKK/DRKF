@@ -1,1 +1,1 @@
-The paper is currently under submission, and more details will be updated later~
+The paper is currently under review, and further details will be provided later.
