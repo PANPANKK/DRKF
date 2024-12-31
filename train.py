@@ -50,7 +50,7 @@ bert_config = BertConfig(
     max_position_embeddings=2800,
     num_labels=num_labels
 )
-AE_layers, AE_blk_num, AE_input_dim=[256,128,64],5,1024
+AE_layers, AE_blk_num, AE_input_dim=[512,256,256],5,1024
 
 roberta_path='../roberta-large-uncased'
 
