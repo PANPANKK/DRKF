@@ -1,1 +1,1 @@
-The paper is currently under review, and further details will be provided later.
+This paper has been accepted for publication at the 33rd ACM International Conference on Multimedia (ACM MM 2025).
